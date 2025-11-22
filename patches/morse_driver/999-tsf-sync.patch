@@ -1,87 +1,20 @@
---- a/mac.c
-+++ b/mac.c
-@@ -69,6 +69,13 @@ static struct ieee80211_supported_band mors_band_5ghz = {
- 	.n_bitrates = ARRAY_SIZE(mors_rates),
- };
-
-+/* Global variables for TSF synchronization */
-+static u64 last_rx_hw_tsf_us = 0;
-+static u64 last_rx_kernel_time_ns = 0;
-+static DEFINE_SPINLOCK(tsf_sync_lock);
-+
-+/* Forward declaration for TSF sync function */
-+static void morse_capture_rx_tsf(const struct morse_skb_rx_status *hdr_rx_status);
-
- void morse_mac_process_rx_noa(struct ieee80211_vif *vif, struct sk_buff *skb, u8 *s1g_ie)
- {
-@@ -5886,6 +5893,40 @@ static inline void morse_mac_preprocess_s1g_action(struct morse *mors,
- 	}
- }
-
-+/**
-+ * morse_capture_rx_tsf - Capture TSF timestamp from received frames
-+ * @hdr_rx_status: RX status containing hardware TSF timestamp
-+ *
-+ * Safely stores the hardware TSF timestamp and corresponding kernel time
-+ * for clock synchronization purposes. This captures ALL received management
-+ * and beacon frames to ensure frequent updates.
-+ */
-+static void morse_capture_rx_tsf(const struct morse_skb_rx_status *hdr_rx_status)
-+{
-+	unsigned long flags;
-+
-+	if (!hdr_rx_status)
-+		return;
-+
-+	spin_lock_irqsave(&tsf_sync_lock, flags);
-+	last_rx_hw_tsf_us = le64_to_cpu(hdr_rx_status->rx_timestamp_us);
-+	last_rx_kernel_time_ns = ktime_get_real_ns();
-+	spin_unlock_irqrestore(&tsf_sync_lock, flags);
-+}
-+
-+/**
-+ * morse_get_tsf_snapshot - Get atomic snapshot of TSF values
-+ * @hw_tsf_us: Output - hardware TSF in microseconds
-+ * @kernel_time_ns: Output - kernel time in nanoseconds
-+ */
-+void morse_get_tsf_snapshot(u64 *hw_tsf_us, u64 *kernel_time_ns)
-+{
-+	unsigned long flags;
-+	spin_lock_irqsave(&tsf_sync_lock, flags);
-+	*hw_tsf_us = last_rx_hw_tsf_us;
-+	*kernel_time_ns = last_rx_kernel_time_ns;
-+	spin_unlock_irqrestore(&tsf_sync_lock, flags);
-+}
-
- static int morse_mac_process_s1g_mgmt_or_beacon(struct morse *mors,
- 						struct ieee80211_vif *vif,
-@@ -5903,6 +5944,10 @@ static int morse_mac_process_s1g_mgmt_or_beacon(struct morse *mors,
- 	u32 ies_mask;
- 	int ret = 0;
-
-+	/* Capture TSF timestamp for clock synchronization from ALL frames */
-+	morse_capture_rx_tsf(hdr_rx_status);
-+
-+	/* Continue with normal frame processing */
- 	fc = morse_hdr_s1g->frame_control;
- 	ies_mask = morse_mac_s1g_ie_get_mask(morse_hdr_s1g);
-
---- a/debug.c
-+++ b/debug.c
-@@ -39,6 +39,9 @@
- #define HOSTIF_LOG_BUFFER_SIZE 10000
- #define HOSTIF_LOG_MAX_LEN 500
-
+diff -Naur morse_driver-clean/debug.c morse_driver-patched/debug.c
+--- morse_driver-clean/debug.c	2025-11-22 13:26:06.690530895 -0800
++++ morse_driver-patched/debug.c	2025-11-22 13:29:53.649409516 -0800
+@@ -21,6 +21,9 @@
+ #include "watchdog.h"
+ #include "wiphy.h"
+ 
 +/* External TSF sync function from mac.c */
 +extern void morse_get_tsf_snapshot(u64 *hw_tsf_us, u64 *kernel_time_ns);
 +
-
- struct hostif_log_entry {
- 	char msg[HOSTIF_LOG_MAX_LEN];
-@@ -1034,6 +1037,68 @@ static const struct file_operations watchdog_fops = {
- 	.llseek = generic_file_llseek,
+ /*
+  * Array of configured LOG levels, indexed by the ID of the feature / module.
+  * Initialised at run-time from the 'debug_mask' module parameter.
+@@ -674,6 +677,72 @@
+ 	.write = morse_debug_watchdog_write,
  };
-
+ 
 +/**
 + * tsf_rx_show - Display last received frame's TSF
 + *
@@ -147,13 +80,14 @@
 +}
 +
 +DEFINE_SHOW_ATTRIBUTE(tsf_current);
-
- static void morse_debug_fw_init(struct morse *mors)
++
+ static ssize_t morse_debug_reset_required_read(struct file *file,
+ 					       char __user *user_buf, size_t count, loff_t *ppos)
  {
-@@ -1161,6 +1224,14 @@ static void morse_debug_fw_init(struct morse *mors)
- 	debugfs_create_file("ps_offload_data", 0600, mors->debug.debugfs_phy, mors,
- 			    &ps_offload_fops);
-
+@@ -1147,6 +1216,13 @@
+ 
+ 	debugfs_create_file("watchdog", 0600, mors->debug.debugfs_phy, mors, &watchdog_fops);
+ 
 +	/* TSF synchronization interfaces */
 +	debugfs_create_file("tsf_rx", 0444, mors->debug.debugfs_phy, mors,
 +			    &tsf_rx_fops);
@@ -161,7 +95,78 @@
 +	debugfs_create_file("tsf_current", 0444, mors->debug.debugfs_phy, mors,
 +			    &tsf_current_fops);
 +
+ 	debugfs_create_file("reset_required", 0600, mors->debug.debugfs_phy, mors,
+ 			    &reset_required_fops);
+ 
+diff -Naur morse_driver-clean/mac.c morse_driver-patched/mac.c
+--- morse_driver-clean/mac.c	2025-11-22 13:26:13.384557024 -0800
++++ morse_driver-patched/mac.c	2025-11-22 13:28:54.056180099 -0800
+@@ -77,6 +77,14 @@
+ /* Max 32 for legacy BA. 8 for 1MHZ NDP BA. 16 for 2+MHZ NDP BA */
+ #define DOT11AH_BA_MAX_MPDU_PER_AMPDU	(32)
+ 
++/* Global variables for TSF synchronization */
++static u64 last_rx_hw_tsf_us = 0;
++static u64 last_rx_kernel_time_ns = 0;
++static DEFINE_SPINLOCK(tsf_sync_lock);
 +
- 	morse_debug_init_logging(mors);
- #endif
++/* Forward declaration for TSF sync function */
++static void morse_capture_rx_tsf(const struct morse_skb_rx_status *hdr_rx_status);
++
+ /* Default alpha-2 code */
+ #define USER_ASSIGNED_ALPHA "ZZ"
+ 
+@@ -5883,6 +5891,41 @@
+ 	return 0;
  }
+ 
++/**
++ * morse_capture_rx_tsf - Capture TSF timestamp from received frames
++ * @hdr_rx_status: RX status containing hardware TSF timestamp
++ *
++ * Safely stores the hardware TSF timestamp and corresponding kernel time
++ * for clock synchronization purposes. This captures ALL received management
++ * and beacon frames to ensure frequent updates.
++ */
++static void morse_capture_rx_tsf(const struct morse_skb_rx_status *hdr_rx_status)
++{
++	unsigned long flags;
++
++	if (!hdr_rx_status)
++		return;
++
++	spin_lock_irqsave(&tsf_sync_lock, flags);
++	last_rx_hw_tsf_us = le64_to_cpu(hdr_rx_status->rx_timestamp_us);
++	last_rx_kernel_time_ns = ktime_get_real_ns();
++	spin_unlock_irqrestore(&tsf_sync_lock, flags);
++}
++
++/**
++ * morse_get_tsf_snapshot - Get atomic snapshot of TSF values
++ * @hw_tsf_us: Output - hardware TSF in microseconds
++ * @kernel_time_ns: Output - kernel time in nanoseconds
++ */
++void morse_get_tsf_snapshot(u64 *hw_tsf_us, u64 *kernel_time_ns)
++{
++	unsigned long flags;
++	spin_lock_irqsave(&tsf_sync_lock, flags);
++	*hw_tsf_us = last_rx_hw_tsf_us;
++	*kernel_time_ns = last_rx_kernel_time_ns;
++	spin_unlock_irqrestore(&tsf_sync_lock, flags);
++}
++
+ static int morse_mac_process_s1g_mgmt_or_beacon(struct morse *mors,
+ 						struct ieee80211_vif *vif,
+ 						struct sk_buff *skb,
+@@ -5900,6 +5943,11 @@
+ 	struct morse_vif *mors_vif = ieee80211_vif_to_morse_vif(vif);
+ 	int ret = 0;
+ 
++	/* Capture TSF timestamp for clock synchronization from ALL frames */
++	morse_capture_rx_tsf(hdr_rx_status);
++
++	/* Continue with normal frame processing */
++
+ 	if (!is_mgmt && !is_s1g_beacon)
+ 		return 0;
+ 
