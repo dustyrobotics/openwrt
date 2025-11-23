@@ -43,3 +43,17 @@ For verbose compilation, consider using
 ```
 
 Once the build is complete a compiled image can be found in `bin/target/<platform>/<target>/`
+
+## TSF Synchronization
+
+This repository includes TSF (Timing Synchronization Function) support for precise time synchronization in HaLow mesh networks.
+
+**Documentation**:
+- [TSF_SYNC_THEORY.md](TSF_SYNC_THEORY.md) - Explains the architecture, design decisions, and technical concepts
+- [TSF_SYNC_DEPLOYMENT.md](TSF_SYNC_DEPLOYMENT.md) - Step-by-step guide to build and deploy production firmware with TSF support
+
+**Quick Summary**:
+- Production firmware with DEBUGFS (no DEBUG bugs)
+- Real-time TSF access via `/sys/kernel/debug/ieee80211/phy0/morse/tsf_*`
+- Tested on BCM27xx (Raspberry Pi 4) with kernel 5.15.167
+- Dual interface: `tsf_rx` (last RX time) and `tsf_current` (extrapolated current time)
