@@ -19,79 +19,62 @@ To verify which patches are being applied, check build output:
 make package/feeds/morse/morse_driver/compile V=s 2>&1 | grep "Applying.*patch"
 ```
 
-### CRITICAL: Line Number Management
+### RECOMMENDED: Quilt-Based Patch Development
 
-When creating patches for the OpenWrt build system, patches are applied **sequentially in alphabetical/numerical order**. Each patch modifies the source, which shifts line numbers for subsequent patches.
+**Use OpenWrt's native `quilt` tool for creating patches.** This ensures correct line numbers by tracking the actual state after each patch is applied.
 
-#### Step-by-Step Patch Development Process:
+#### Quilt Workflow (Recommended):
 
-1. **Start with clean source**
+1. **Install quilt:**
+   ```bash
+   sudo apt-get install quilt
+   ```
+
+2. **Prepare source with existing patches:**
    ```bash
    make package/feeds/morse/morse_driver/clean
+   make package/feeds/morse/morse_driver/prepare QUILT=1
+   cd build_dir/target-aarch64_cortex-a72_musl/linux-bcm27xx_bcm2711/morse_driver-1.16.4/
    ```
 
-2. **Apply patches incrementally and verify line numbers**
-   - Patches in `patches/morse_driver/` are applied in order (001, 002, 998, 999, etc.)
-   - After each patch, line numbers shift
-   - **NEVER assume line numbers from the original source**
-
-3. **To create a new patch:**
-
-   a. **Prepare source with existing patches:**
+3. **Apply all existing patches:**
    ```bash
-   make package/feeds/morse/morse_driver/prepare
+   quilt push -a
+   # This applies patches 001-015 (or however many exist)
    ```
 
-   b. **Verify current state and line numbers:**
+4. **Create your new patch:**
    ```bash
-   # Check actual line numbers after existing patches
-   grep -n "function_name" build_dir/.../morse_driver-X.X.X/file.c
+   quilt new 990-my-feature.patch
+   quilt add mac.c  # Add files you'll modify
+   # Make your edits to mac.c
+   quilt refresh  # Generates patch with correct line numbers!
    ```
 
-   c. **Make your changes manually to the prepared source**
-   - Edit files in `build_dir/target-*/linux-*/morse_driver-*/`
-   - Use actual line numbers from the prepared (patched) source
-
-   d. **Generate the patch:**
+5. **Copy to feeds directory:**
    ```bash
-   # From inside build_dir/.../morse_driver-X.X.X/
-   diff -Naur original_file.c modified_file.c > /tmp/new.patch
+   cp patches/990-my-feature.patch /home/dzezula/openwrt/feeds/morse/essentials/morse_driver/patches/
    ```
 
-   e. **Verify line numbers in patch file:**
-   - Open the patch and check `@@ -XXX,YYY +AAA,BBB @@` lines
-   - These should match the **post-patch** line numbers
-
-4. **Test the complete patch sequence:**
+6. **Test clean build:**
    ```bash
+   cd /home/dzezula/openwrt
    make package/feeds/morse/morse_driver/clean
    make package/feeds/morse/morse_driver/compile V=s
    ```
 
-   - Check build log for patch application messages
-   - Look for "Hunk #N succeeded at XXXX (offset Y lines)" - this indicates line number mismatch
-   - If you see offset warnings, line numbers need adjustment
+**Why quilt?**
+- Automatically handles line number shifts from previous patches
+- Tracks which files belong to which patch
+- Generates patches with correct context
+- OpenWrt-native tool, designed for this workflow
 
-### Common Pitfalls:
+### Patch Numbering
 
-❌ **WRONG:** Creating patches based on original source line numbers
-❌ **WRONG:** Assuming line numbers stay the same across patches
-❌ **WRONG:** Not testing clean builds after adding patches
-
-✅ **CORRECT:** Always use line numbers from prepared (patched) source
-✅ **CORRECT:** Test full clean build after each new patch
-✅ **CORRECT:** Account for cumulative line shifts from all previous patches
-
-### Example: TSF Sync Patch Development
-
-Our current patches:
-- `998-disable-hw-channel-ignore.patch` - Applied first
-- `999-tsf-sync-with-debug.patch` - Applied second (our new patch)
-
-When creating `999-tsf-sync-with-debug.patch`:
-1. The source already has changes from `998-*`
-2. Line numbers must reflect the state **after** patch 998 is applied
-3. To find correct lines: `make prepare`, then check actual line numbers
+Patches apply in lexicographic order (string sort, not numeric):
+- `001-015`: Upstream patches
+- `990-999`: Custom patches
+- **Note:** `"1000"` sorts BEFORE `"999"` (string comparison)!
 
 ## Build System Notes
 
@@ -110,11 +93,11 @@ To persist changes:
 
 ### Patch Naming Convention
 
-- `0XX-*.patch` - Core functionality patches
-- `9XX-*.patch` - Custom/experimental patches
-- `999-*.patch` - Our TSF sync and debug instrumentation
+- `001-015` - Upstream patches
+- `990-991` - TSF sync patches (mac.c core + debugfs interfaces)
+- `992-999` - Reserved for future custom patches
 
-Patches are applied in ASCII sort order.
+Patches are applied in lexicographic (ASCII) sort order.
 
 ### Disabling Patches
 
@@ -151,27 +134,30 @@ This gives us:
 
 ## TSF Sync Architecture
 
-### Current Implementation (999-tsf-sync-with-debug.patch)
+### Current Implementation
+
+**Patches:**
+- `990-tsf-mac-core.patch` - Core TSF capture in mac.c
+- `991-tsf-debugfs.patch` - Debugfs interfaces in debug.c
 
 **Key Insight:** TSF must be captured from **ALL frames** (data + management), not just beacons.
 
-**Correct location:** `morse_mac_skb_recv()` - entry point for ALL received frames
+**Implementation location:** `morse_mac_skb_recv()` - entry point for ALL received frames
 
-**Wrong location:** `morse_rx_process_skb()` - only processes management/beacon frames
+**How it works:**
+1. Every frame calls `morse_capture_rx_tsf()` with hardware TSF timestamp
+2. Spinlock-protected globals store: `last_rx_hw_tsf_us` and `last_rx_kernel_time_ns`
+3. `morse_get_tsf_snapshot()` provides atomic read of both values
+4. Debugfs interfaces expose TSF to userspace
 
-### Debug Counters
-
-Added to trace execution flow:
-- `morse_mac_skb_recv_calls` - Count all RX frames
-- `morse_capture_rx_tsf_calls` - Count TSF captures
-- `morse_mac_skb_recv_early_returns` - Count early exits
-
-Exposed via: `/sys/kernel/debug/ieee80211/phy0/morse/rx_debug_counters`
+**Debugfs interfaces:**
+- `/sys/kernel/debug/ieee80211/phy0/morse/tsf_rx` - Last captured TSF from RX frame
+- `/sys/kernel/debug/ieee80211/phy0/morse/tsf_current` - Extrapolated current TSF
 
 ### Testing TSF Updates
 
 ```bash
-# On client, check TSF updates with data traffic
+# On client, verify TSF updates with ping traffic
 ssh root@192.168.1.97 'ping -c 5 192.168.1.133 > /dev/null & \
   for i in 1 2 3 4 5; do \
     cat /sys/kernel/debug/ieee80211/phy0/morse/tsf_rx; \
@@ -179,7 +165,7 @@ ssh root@192.168.1.97 'ping -c 5 192.168.1.133 > /dev/null & \
   done'
 ```
 
-If TSF values are identical across reads → not capturing from data frames.
+TSF values should update with each ping packet (data frames).
 
 ## Git Workflow
 
@@ -191,16 +177,9 @@ When modifying patches:
 3. Commit the patch file change
 4. Document in commit message what the patch does
 
-## Lessons Learned
+## Key Takeaways
 
-1. **Always verify patch application order** - Use `make package/.../prepare V=s` to see patch sequence
-2. **Line numbers shift** - Each patch changes subsequent line numbers
-3. **Test clean builds** - Manual edits are ephemeral, patches are permanent
-4. **Fuzzy matching is dangerous** - Patches can apply to wrong locations if context is similar
-5. **One patch at a time** - Incremental development prevents cascading failures
-
-## Future Improvements
-
-- [ ] Automated testing of patch application
-- [ ] Script to verify TSF updates with data frames
-- [ ] Comprehensive test suite for TSF sync functionality
+1. **Use quilt for patch development** - Handles line number shifts automatically
+2. **Test clean builds** - Verify patches apply correctly from clean state
+3. **Lexicographic ordering matters** - `"1000"` sorts before `"999"`
+4. **TSF capture location is critical** - Must be in `morse_mac_skb_recv()` to capture ALL frames
