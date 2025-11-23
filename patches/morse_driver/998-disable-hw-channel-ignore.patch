@@ -1,0 +1,13 @@
+--- a/mac.c
++++ b/mac.c
+@@ -2580,7 +2580,9 @@ static int morse_mac_ops_start(struct ieee80211_hw *hw)
+ 	mors->started = true;
+
+ 	/* Retrieve channels from the HW that are unusable */
+-	set_hw_ignored_s1g_channels(hw);
++	/* WORKAROUND: Disabled to prevent firmware from marking valid channels as unusable
++	 * This is necessary for DEBUG builds where firmware incorrectly reports channels as disabled */
++	/* set_hw_ignored_s1g_channels(hw); */
+
+ 	if (mors->cfg->set_slow_clock_mode)
+ 		mors->cfg->set_slow_clock_mode(mors, morse_mac_slow_clock_mode());
