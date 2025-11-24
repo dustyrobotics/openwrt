@@ -1,0 +1,219 @@
+diff -Naur morse_driver-clean/debug.c morse_driver-patched/debug.c
+--- morse_driver-clean/debug.c	2025-11-22 13:26:06.690530895 -0800
++++ morse_driver-patched/debug.c	2025-11-23 10:10:00.000000000 -0800
+@@ -21,6 +21,12 @@
+ #include "watchdog.h"
+ #include "wiphy.h"
+
++/* External TSF sync function from mac.c */
++extern void morse_get_tsf_snapshot(u64 *hw_tsf_us, u64 *kernel_time_ns);
++
++/* External debug counters from mac.c for RX path tracing */
++extern atomic_t morse_mac_skb_recv_calls;
++extern atomic_t morse_capture_rx_tsf_calls;
++extern atomic_t morse_mac_skb_recv_early_returns;
++
+ /*
+  * Array of configured LOG levels, indexed by the ID of the feature / module.
+  * Initialised at run-time from the 'debug_mask' module parameter.
+@@ -674,6 +680,99 @@
+ 	.write = morse_debug_watchdog_write,
+ };
+
++/**
++ * tsf_rx_show - Display last received frame's TSF
++ *
++ * Shows the TSF timestamp captured from the last received frame (ANY type).
++ * This is used by CLIENTS (Gateway/Station) to determine when a packet arrived.
++ *
++ * Output format:
++ *   TSF: <hardware_tsf_us>
++ *   SYS: <kernel_time_ns>
++ */
++static int tsf_rx_show(struct seq_file *m, void *v)
++{
++	u64 hw_tsf_us, kernel_time_ns;
++
++	morse_get_tsf_snapshot(&hw_tsf_us, &kernel_time_ns);
++
++	seq_printf(m, "TSF: %llu\n", hw_tsf_us);
++	seq_printf(m, "SYS: %llu\n", kernel_time_ns);
++
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(tsf_rx);
++
++/**
++ * tsf_current_show - Display extrapolated current TSF
++ *
++ * Calculates the current TSF by extrapolating from the last received frame.
++ * Formula: current_tsf = last_rx_tsf + (current_time - last_rx_time)
++ *
++ * This is used by APs (Robot/Master) to get the current hardware time
++ * for broadcasting in time sync packets.
++ *
++ * Output format:
++ *   TSF: <current_tsf_us>
++ *   SYS: <current_kernel_time_ns>
++ *
++ * Note: TSF increments at 1 MHz (1 tick per microsecond), so we can
++ * accurately extrapolate by adding the time delta.
++ */
++static int tsf_current_show(struct seq_file *m, void *v)
++{
++	u64 last_hw_tsf_us, last_kernel_time_ns;
++	u64 current_kernel_time_ns;
++	u64 delta_ns, delta_us;
++	u64 current_tsf_us;
++
++	/* Get last captured values */
++	morse_get_tsf_snapshot(&last_hw_tsf_us, &last_kernel_time_ns);
++
++	/* Get current kernel time */
++	current_kernel_time_ns = ktime_get_real_ns();
++
++	/* Calculate time delta and extrapolate TSF */
++	delta_ns = current_kernel_time_ns - last_kernel_time_ns;
++	delta_us = delta_ns / 1000;  /* Convert ns to us */
++	current_tsf_us = last_hw_tsf_us + delta_us;
++
++	seq_printf(m, "TSF: %llu\n", current_tsf_us);
++	seq_printf(m, "SYS: %llu\n", current_kernel_time_ns);
++
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(tsf_current);
++
++/**
++ * rx_debug_counters_show - Display RX path debug counters
++ *
++ * Shows atomic counters used to trace execution flow through RX path.
++ * Useful for debugging TSF capture issues and understanding which
++ * code paths are executed during frame reception.
++ *
++ * Output format:
++ *   morse_mac_skb_recv_calls: <count>
++ *   morse_capture_rx_tsf_calls: <count>
++ *   morse_mac_skb_recv_early_returns: <count>
++ */
++static int rx_debug_counters_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "morse_mac_skb_recv_calls: %d\n",
++		   atomic_read(&morse_mac_skb_recv_calls));
++	seq_printf(m, "morse_capture_rx_tsf_calls: %d\n",
++		   atomic_read(&morse_capture_rx_tsf_calls));
++	seq_printf(m, "morse_mac_skb_recv_early_returns: %d\n",
++		   atomic_read(&morse_mac_skb_recv_early_returns));
++
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(rx_debug_counters);
++
+ static ssize_t morse_debug_reset_required_read(struct file *file,
+ 					       char __user *user_buf, size_t count, loff_t *ppos)
+ {
+@@ -1147,6 +1246,17 @@
+
+ 	debugfs_create_file("watchdog", 0600, mors->debug.debugfs_phy, mors, &watchdog_fops);
+
++	/* TSF synchronization interfaces */
++	debugfs_create_file("tsf_rx", 0444, mors->debug.debugfs_phy, mors,
++			    &tsf_rx_fops);
++
++	debugfs_create_file("tsf_current", 0444, mors->debug.debugfs_phy, mors,
++			    &tsf_current_fops);
++
++	/* RX path debug counters for tracing TSF capture issues */
++	debugfs_create_file("rx_debug_counters", 0444, mors->debug.debugfs_phy, mors,
++			    &rx_debug_counters_fops);
++
+ 	debugfs_create_file("reset_required", 0600, mors->debug.debugfs_phy, mors,
+ 			    &reset_required_fops);
+
+diff -Naur morse_driver-clean/mac.c morse_driver-patched/mac.c
+--- morse_driver-clean/mac.c	2025-11-22 13:26:13.384557024 -0800
++++ morse_driver-patched/mac.c	2025-11-23 10:10:00.000000000 -0800
+@@ -77,6 +77,18 @@
+ /* Max 32 for legacy BA. 8 for 1MHZ NDP BA. 16 for 2+MHZ NDP BA */
+ #define DOT11AH_BA_MAX_MPDU_PER_AMPDU	(32)
+
++/* Global variables for TSF synchronization */
++static u64 last_rx_hw_tsf_us = 0;
++static u64 last_rx_kernel_time_ns = 0;
++static DEFINE_SPINLOCK(tsf_sync_lock);
++
++/* Debug counters for RX path tracing (exported for debugfs) */
++atomic_t morse_mac_skb_recv_calls = ATOMIC_INIT(0);
++atomic_t morse_capture_rx_tsf_calls = ATOMIC_INIT(0);
++atomic_t morse_mac_skb_recv_early_returns = ATOMIC_INIT(0);
++
++/* Forward declaration for TSF sync function */
++static void morse_capture_rx_tsf(const struct morse_skb_rx_status *hdr_rx_status);
++
+ /* Default alpha-2 code */
+ #define USER_ASSIGNED_ALPHA "ZZ"
+
+@@ -5883,6 +5895,43 @@
+ 	return 0;
+ }
+
++/**
++ * morse_capture_rx_tsf - Capture TSF timestamp from received frames
++ * @hdr_rx_status: RX status containing hardware TSF timestamp
++ *
++ * Safely stores the hardware TSF timestamp and corresponding kernel time
++ * for clock synchronization purposes. This captures ALL received frames
++ * (data, management, beacons) to ensure updates on every packet.
++ */
++static void morse_capture_rx_tsf(const struct morse_skb_rx_status *hdr_rx_status)
++{
++	unsigned long flags;
++
++	atomic_inc(&morse_capture_rx_tsf_calls);
++
++	if (!hdr_rx_status)
++		return;
++
++	spin_lock_irqsave(&tsf_sync_lock, flags);
++	last_rx_hw_tsf_us = le64_to_cpu(hdr_rx_status->rx_timestamp_us);
++	last_rx_kernel_time_ns = ktime_get_real_ns();
++	spin_unlock_irqrestore(&tsf_sync_lock, flags);
++}
++
++/**
++ * morse_get_tsf_snapshot - Get atomic snapshot of TSF values
++ * @hw_tsf_us: Output - hardware TSF in microseconds
++ * @kernel_time_ns: Output - kernel time in nanoseconds
++ */
++void morse_get_tsf_snapshot(u64 *hw_tsf_us, u64 *kernel_time_ns)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&tsf_sync_lock, flags);
++	*hw_tsf_us = last_rx_hw_tsf_us;
++	*kernel_time_ns = last_rx_kernel_time_ns;
++	spin_unlock_irqrestore(&tsf_sync_lock, flags);
++}
+
+ /**
+  * morse_rx_process_skb - Process non-data S1G frames
+@@ -6020,8 +6069,15 @@
+ 	struct morse_vif *mors_vif;
+ 	bool skb_needs_free = true;
+
+-	if (!mors->started)
++	atomic_inc(&morse_mac_skb_recv_calls);
++
++	/* Capture TSF timestamp from ALL frames (data + management) before any filtering */
++	morse_capture_rx_tsf(hdr_rx_status);
++
++	if (!mors->started) {
++		atomic_inc(&morse_mac_skb_recv_early_returns);
+ 		goto exit;
++	}
+
+ 	if (!skb || !hw || !hdr_rx_status) {
+ 		MORSE_PR_ERR(FEATURE_ID_DEFAULT, "%s: Invalid parameter\n", __func__);
